@@ -1,0 +1,104 @@
+import torch
+import torch.nn.functional as F
+from lrp_func_conv import conv2d, conv3d
+from torch.nn.modules.utils import _pair
+from typing import TypeVar, Union, Tuple, Optional
+
+T = TypeVar('T')
+_scalar_or_tuple_2_t = Union[T, Tuple[T, T]]
+_size_2_t = _scalar_or_tuple_2_t[int]
+
+
+class Conv2d(torch.nn.Conv2d): 
+    def __init__(self,                
+                in_channels: int,
+                out_channels: int,
+                kernel_size: _size_2_t,
+                stride: _size_2_t = 1,
+                padding: _size_2_t = 0,
+                dilation: _size_2_t = 1,
+                groups: int = 1,
+                bias: bool = True,
+                padding_mode: str = 'zeros',
+                rule="alpha2beta1"):
+        super().__init__(in_channels, 
+                         out_channels, 
+                         kernel_size,
+                         stride,
+                         padding,
+                         dilation,
+                         groups,
+                         bias,
+                         padding_mode)
+        self.rule = rule
+    def _conv_forward_explain(self, input, weight, conv2d_fn, **kwargs):
+        if self.padding_mode != 'zeros':
+            return conv2d_fn(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                            weight, self.bias, self.stride,
+                            _pair(0), self.dilation, self.groups, **kwargs)
+       
+        else: return conv2d_fn(input, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+
+    def forward(self, input, explain=True, **kwargs):
+        if not explain: return super(Conv2d, self).forward(input)
+        return self._conv_forward_explain(input, self.weight, conv2d[self.rule], **kwargs)
+
+    @classmethod
+    def from_torch(cls, conv, rule):
+        in_channels = conv.weight.shape[1] * conv.groups
+        bias = conv.bias is not None
+
+        module = cls(in_channels, conv.out_channels, conv.kernel_size, conv.stride, conv.padding, conv.dilation, conv.groups, bias=bias, padding_mode=conv.padding_mode, rule=rule)
+
+        module.load_state_dict(conv.state_dict())
+
+        return module.cuda()
+    
+    
+class Conv3d(torch.nn.Conv3d): 
+    def __init__(self,                
+                in_channels: int,
+                out_channels: int,
+                kernel_size: _size_2_t,
+                stride: _size_2_t = 1,
+                padding: _size_2_t = 0,
+                dilation: _size_2_t = 1,
+                groups: int = 1,
+                bias: bool = True,
+                padding_mode: str = 'zeros',
+                rule="gamma+epsilon"):
+        super().__init__(in_channels, 
+                         out_channels, 
+                         kernel_size,
+                         stride,
+                         padding,
+                         dilation,
+                         groups,
+                         bias,
+                         padding_mode)
+        self.rule = rule
+    def _conv_forward_explain(self, input, weight, conv3d_fn, **kwargs):
+        if self.padding_mode != 'zeros':
+            return conv3d_fn(F.pad(input, self._reversed_padding_repeated_twice, mode=self.padding_mode),
+                            weight, self.bias, self.stride,
+                            _pair(0), self.dilation, self.groups, **kwargs)
+       
+        else: return conv3d_fn(input, weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
+
+
+    def forward(self, input, explain=True, **kwargs):
+        if not explain: return super(Conv3d, self).forward(input)
+        return self._conv_forward_explain(input, self.weight, conv3d[self.rule], **kwargs)
+
+    @classmethod
+    def from_torch(cls, conv, rule):
+        in_channels = conv.weight.shape[1] * conv.groups
+        bias = conv.bias is not None
+
+        module = cls(in_channels, conv.out_channels, conv.kernel_size, conv.stride, conv.padding, conv.dilation, conv.groups, bias=bias, padding_mode=conv.padding_mode, rule=rule)
+
+        module.load_state_dict(conv.state_dict())
+
+        return module.cuda()
+
