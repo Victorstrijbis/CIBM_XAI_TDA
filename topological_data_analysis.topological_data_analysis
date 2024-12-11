@@ -1,0 +1,296 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 11 21:10:36 2024
+
+@author: Researcher
+"""
+
+
+import optparse
+
+import gudhi
+import seaborn as sns
+import numpy as np
+import pandas as pd
+import nibabel as nib
+import scipy
+from supp_functions import *
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LinearRegression
+
+
+#%%
+
+def linear_model(X,y):
+    corr = np.corrcoef(X,y)
+    
+    reg = LinearRegression().fit(np.array(list(X)).reshape(-1,1),y)
+    x = np.linspace(np.min(X),np.max(X),1000)
+    y = reg.coef_*x + reg.intercept_
+    
+    return x,y,corr
+
+def do_pca(inp_data,ncomp):
+    
+    pca = PCA(n_components=ncomp)
+    pca_transform = pca.fit_transform(inp_data)
+    
+    evr = pca.explained_variance_ratio_
+    evs = pca.components_
+    lambdas = pca.singular_values_
+    
+    return pca_transform, evr, evs, lambdas
+
+def generate_PCA_subplots(X,Y,ncomp,EVR,savepath,title=0):
+
+    fig, axs = plt.subplots(nrows=ncomp,ncols=ncomp,figsize=(10,10),sharey=True,sharex=True)
+    
+    fig.suptitle("PCA decomposition modes 1-{}".format(ncomp),fontsize=20)
+    if title != 0:
+        fig.suptitle(title,fontsize=20)
+    
+    r = 0; t = 0
+    
+    sortdscs_idx = sorted(range(len(Y)),key=lambda k: Y[k],reverse=True)
+    sortdscs = sorted(Y,reverse=True)
+    
+    X_subst=np.zeros(X.shape)
+    for tmp, i in enumerate(sortdscs_idx):
+        X_subst[tmp,:] = X[i,:]
+    
+    
+    Y = sortdscs
+    X = X_subst
+
+
+    del X_subst
+    
+    for ax in axs.flat:
+    
+        im = ax.scatter(X[:,t],X[:,r],s=5+20/ncomp,c=Y,cmap=plt.cm.inferno,alpha=0.8)#,vmin=0.4,vmax=0.95,)
+        
+        if t == 0:
+            axs[r,t].set_ylabel(r"$λ_{}$".format(r+1),fontsize=16)
+            
+        if r == 0:
+            axs[r,t].set_title(np.round(EVR[t],3))
+        axs[0,0].set_title("EVR: {}".format(np.round(EVR[0],3)))
+    
+        if r == ncomp-1:
+            axs[r,t].set_xlabel(r"$λ_{}$".format(t+1),fontsize=16)
+            
+    
+        x,y,corr = linear_model(X[:,t],X[:,r])
+        
+        ax.plot(x,y,'k',label='Corr = {}'.format(np.round(corr[0,1],4)))
+    
+        ax.legend()#loc='lower right')
+    
+    
+        r += 1
+        if r % ncomp == 0:
+            t += 1
+            r = 0
+    
+    fig.tight_layout()
+    
+    fig.subplots_adjust(right=0.83)
+    cbar_ax = fig.add_axes([0.85,0.15,0.03,0.7])
+    fig.colorbar(im,cax=cbar_ax,label='Dice')
+    
+    plt.savefig(savepath,dpi=300)
+
+def betti_curves(diag,res=0.001):
+    
+    import collections
+    
+    bettis = [diag[i][0] for i in np.arange(len(diag))]
+    cc = collections.Counter(bettis)
+    
+    # print(cc)
+    
+    step = np.arange(0,1,res)
+    
+    betti_list = []
+    
+    for betti_dim in range(len(cc)):
+        print("Calculating betti curve {}".format(betti_dim))
+        betti_mat = np.zeros((cc[betti_dim],len(step)))
+        
+        js = []
+        for j in np.arange(len(diag)):
+            if diag[j][0] == betti_dim:
+                js.append(j)
+    
+        assert len(js) == cc[betti_dim]
+        
+        for j, tmp in enumerate(js,0):
+            assert diag[tmp][0] == betti_dim
+            
+            line = diag[tmp][1]
+            
+            #plt.figure()
+            #print(line)
+        
+            a = 0;
+            for i in step:
+                if i < line[0]:
+                    a = i
+        
+                if i < line[1]:
+                    b = i
+                    
+            a += 1*res
+            b -= 1*res
+                    
+            # print([j,tmp])
+            betti_mat[j,int(a/res):int(b/res)] = 1
+        
+        betti_list.append(betti_mat)
+    
+    return betti_list
+
+#%%
+
+
+def do_ph(im,dice,save_path_results,homology_coeff_field=2,min_persistence=0.001,x_res=0.001, pers_thresh=0.001):
+
+    cls = [0.05]*len(backends)
+    
+    cl = cls[backend_ind]
+    
+    # im = Q[n]
+    imq = im
+    if backend != 'pnet':
+        imq = exposure.equalize_adapthist(im,clip_limit=cl)
+    pers_thresh = np.median(imq)
+    if backend not in ['gcam','gcampp']:
+        pers_thresh += np.std(imq)
+    
+    # pers_thresh = 0.1
+    
+    a = -5
+    A = im[a:-a,a:-a,a:-a]>pers_thresh # This could lead to problems with other maps
+    
+    print(min_persistence)
+    print(x_res)
+    print(pers_thresh)
+    
+        
+    u = save_string(i)
+
+    a1, a2 = [np.min(np.nonzero(A)[0]),np.max(np.nonzero(A)[0])]
+    b1, b2 = [np.min(np.nonzero(A)[1]),np.max(np.nonzero(A)[1])]
+    c1, c2 = [np.min(np.nonzero(A)[2]),np.max(np.nonzero(A)[2])]
+
+    a1 += 5; a2 += 5
+    b1 += 5; b2 += 5
+    c1 += 5; c2 += 5
+    
+    a1 = np.max([0,a1]); a2 = np.min([im.shape[0],a2])
+    b1 = np.max([0,b1]); b2 = np.min([im.shape[1],b2])
+    c1 = np.max([0,c1]); c2 = np.min([im.shape[2],c2])
+
+    top_dim_cells_im = im[a1:a2,b1:b2,c1:c2]
+    
+    plt.figure()
+    plt.title(u)
+    plt.imshow(np.mean(top_dim_cells_im,axis=-1))
+    plt.savefig(save_path_results + '/' + u + "_projection_ax.png")
+    plt.close()
+    
+    plt.figure()
+    plt.title(u)
+    plt.imshow(np.mean(top_dim_cells_im,axis=-2))
+    plt.savefig(save_path_results + '/' + u + "_projection_cor.png")
+    plt.close()
+    
+    cubical_complex = gudhi.CubicalComplex(top_dimensional_cells=top_dim_cells_im)#list((i,j,k)) for i in range(im.shape[0]) for j in range(im.shape[1]) for k in range(im.shape[2]) if im[i,j,k] > 0.5])
+         
+    diag = cubical_complex.persistence()
+    
+    O = cubical_complex.persistence(homology_coeff_field=homology_coeff_field,min_persistence=min_persistence) # How to choose this threshold?
+    
+    # print(len(O))
+    
+    
+    # plt.figure(figsize=(14,10))
+    gudhi.plot_persistence_barcode(O,legend=True,max_intervals=0)
+    plt.title("Persistence barcodes " + u, fontsize=15)# + ", DSC = " + str(dscs[i]))
+    plt.savefig(save_path_results + '/' + u + "_barcodes.png")
+    plt.close()
+    
+    # plt.figure(figsize=(14,10))
+    gudhi.plot_persistence_diagram(O,legend=True,max_intervals=0)
+    plt.title("Persistence diagram " + u, fontsize=15)# + ", DSC = " + str(dscs[i]))
+    plt.tick_params(axis='both',labelsize=15)
+    plt.xlabel("Birth",fontsize=15)
+    plt.ylabel("Death",fontsize=15)
+    plt.savefig(save_path_results + '/' + u + "_diagram.png")
+    plt.close()
+    
+    gudhi.plot_persistence_density(O,legend=True,max_intervals=0)
+    plt.title("Persistence density " + u, fontsize=15)# + ", DSC = " + str(dscs[i]))
+    plt.savefig(save_path_results + '/' + u + "_density.png")
+    plt.close()
+    
+    
+
+    
+    betti_list = betti_curves(O,x_res)
+    
+    betti0 = betti_list[0]; betti1 = betti_list[1]; betti2 = betti_list[2]
+    bcurve0 = np.sum(betti0,axis=0)
+    bcurve1 = np.sum(betti1,axis=0)
+    bcurve2 = np.sum(betti2,axis=0)
+    
+    # inp = betti2
+    euler = bcurve0-bcurve1+bcurve2
+    # plt.figure()
+    # for i in np.arange(inp.shape[0]):
+    #     plt.plot(inp[i,:])
+    
+    
+    
+    plt.figure()
+    plt.title("EC + Betti curves, pat " + u + ", DSC = " + str(dice),fontsize=15)
+    plt.plot(euler,color='k',label='B0 - B1 + B2',alpha=0.5)
+    plt.plot(bcurve0,color='tab:red',label='Betti 0',alpha=0.5)
+    plt.plot(bcurve1,color='tab:blue',label='Betti 1',alpha=0.5)
+    plt.plot(bcurve2,color='tab:green',label='Betti 2',alpha=0.5)
+    plt.legend()
+    plt.savefig(save_path_results + "/" + u + "_euler.png")
+    plt.close()
+    
+    return bcurve0, bcurve1, bcurve2, euler
+
+#%%
+
+from persistent_homology import *
+
+"""
+arbitrary save folder
+"""
+
+save_paths_results = 'save_path/'
+    
+bc0list = []
+bc1list = []
+bc2list = []
+eclist = []
+
+for i in np.arange(N):
+
+    bc0,bc1,bc2,ec=do_ph(Q[i],d[i],save_path_results,homology_coeff_field=2,min_persistence=0.02,x_res=0.002,pers_thresh=pers_thresh) # normale waarden: homology_coeff_field=2,min_persistence=0.0005,x_res=0.001)
+
+    np.save(save_path_results + save_string(i) + '_b0.npy',bc0)
+    np.save(save_path_results + save_string(i) + '_b1.npy',bc1)
+    np.save(save_path_results + save_string(i) + '_b2.npy',bc2)
+    np.save(save_path_results + save_string(i) + '_ec.npy',ec)
+
+    bc0list.append(bc0)
+    bc1list.append(bc1)
+    bc2list.append(bc2)
+    eclist.append(ec)
+    
