@@ -1,0 +1,88 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 11 20:29:09 2024
+
+@author: Researcher
+"""
+
+import numpy as np
+import torch
+import copy
+import torch.nn.functional as F
+from utils import *
+
+
+class GuidedBackpropReLUModel:
+    def __init__(self, model, weights_path):
+        # the model is your CNN that you use for segmentation
+        # here I just make a copy of the model and load the weights from a checkpoint
+        self.model = copy.deepcopy(model)
+        self.model.load_state_dict(torch.load(weights_path)['state_dict'])
+        self.model.cuda()
+        
+        # this is the function that applies ReLU 
+        #to the gradients during backpropagation
+        def hook(module, grad_input, grad_output):            
+            return tuple(F.relu(grad) for grad in grad_input)
+        
+        # here you apply the hook function to different layers 
+        def recursive_relu_apply(module_list, module_top):            
+            for idx, module in module_top._modules.items():
+                recursive_relu_apply(module_list, module)
+                if module.__class__.__name__ == 'ReLU':
+                    module_top._modules[idx].register_backward_hook(hook) # uncommented?
+                    module_list.append(module_top._modules[idx])
+            
+            return module_list
+                    
+        top_modules = [self.model]
+        # replace ReLU with GuidedBackpropReLU
+        self.module_list = []
+        for m in top_modules:
+            self.module_list = recursive_relu_apply(self.module_list, m)
+
+    
+    def __call__(self, image):   
+        # this just specifies that you want to record the gradient 
+        #that flows back to the input image
+        image = image.requires_grad_(True)
+        # print('image: ', image.shape)
+        # run forward pass
+        y_pred = self.model(image)
+        # print('y_pred: ', y_pred.shape)
+        # select the organ for which you will compute the heatmap
+        y_pred = y_pred[0,:,:,:,:]
+        y_pred_sigmoid = torch.sigmoid(y_pred).detach().cpu().numpy()  
+
+        
+        maps = []
+        # for each image in the batch
+        # print(y_pred_sigmoid)
+        for i in range(y_pred_sigmoid.shape[0]):
+            # select the voxels that are classified as your selected OAR
+            # those are the voxels with a probability >= 0.5
+            
+            idxs = (y_pred_sigmoid[i] >= 0.50)
+            fg = y_pred[i][idxs]
+            
+            # sum up the selected voxels to generate the heatmap w.r.t. the entire OAR
+            val = torch.sum(fg)
+            
+            val.requires_grad_(True) 
+            
+            # run backward pass
+            val.backward(retain_graph=True)          
+            
+            
+            # get the heatmap
+            output = image.grad.cpu().data.numpy()[0]
+            
+            # normalize the heatmap between 0 and 1
+            output = (output - np.min(output)) / (np.max(output)-np.min(output))
+            # reset the gradient before computing the next image in the batch
+            image.grad = None
+            
+            maps.append(output)     
+       
+        
+        return np.stack(maps, axis=1)
