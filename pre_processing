@@ -1,0 +1,581 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 11 20:55:03 2024
+
+@author: Researcher
+"""
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import re
+import os
+import pydicom
+from PIL import Image, ImageDraw
+import optparse
+from skimage.transform import resize
+import scipy.ndimage
+import glob as glob
+import datetime
+
+#%%
+
+parser = optparse.OptionParser()
+
+parser.add_option('--npat','--npat', action="store", dest="npat",\
+                  help="patient number variable",default=730)
+    
+options, args = parser.parse_args()
+    
+pvar = int(options.npat)
+
+
+
+npat = 0
+
+
+def atoi(text):
+    return int(text) if text.isdigit() else text
+
+def natural_keys(text):
+    '''
+    alist.sort(key=natural_keys) sorts in human order
+    '''
+    return [ atoi(c) for c in re.split(r'(\d+)',text) ]
+
+
+def binary_close(input_img):
+
+    image3d = scipy.ndimage.binary_dilation(input_img)
+    image3d = scipy.ndimage.binary_erosion(image3d)
+    
+    return image3d
+
+def binary_open(input_img):
+    
+    image3d = scipy.ndimage.binary_erosion(input_img)
+    image3d = scipy.ndimage.binary_dilation(image3d)
+    
+    return image3d
+
+def close_images(input_label_list):
+    
+    for ii in np.arange(input_label_list.shape[-1]):
+        print("Interpolating between slices of structure {}".format(ii+1))
+        input_label_list[:,:,:,ii] = binary_close(input_label_list[:,:,:,ii])
+
+    print("")
+
+    return input_label_list
+
+def open_images(input_label_list):
+    
+    
+    
+    for ii in np.arange(input_label_list.shape[-1]):
+        print("Removing false positives in structure {}".format(ii+1))
+        
+        # print(input_label_list[:,:,:,ii].sum())
+        
+        input_label_list[:,:,:,ii] = binary_open(input_label_list[:,:,:,ii])
+        
+        # print(input_label_list[:,:,:,ii].sum())
+
+    print("")
+    return input_label_list
+
+def clip_CT(inp,cap_min,cap_max):
+
+    mask1 = (inp < cap_min)# & (A > 500)
+    mask2 = (inp > cap_max)
+    inp[mask1] = cap_min
+    inp[mask2] = cap_max
+    
+    return inp
+
+def image_regrid(patient_CT, patient_RS, patient_RD, output_dims, selected_structures, original_spacing):
+
+    "Image to be resized to new pixel spacings x_r, y_r, z_r"    
+        
+    global npat
+    global path
+    
+    x_r, y_r, z_r = output_dims
+    
+    # if patient_RD == 0:
+        # CT_data, RS_data = read_data_lymph()
+    # else: 
+    # CT_data, RS_data, RD_data = read_data()
+    
+    pixelspacing_x = original_spacing[0]
+    pixelspacing_y = original_spacing[1]
+    slicethickness_z = original_spacing[2]
+    
+    psx = pixelspacing_x/x_r
+    psy = pixelspacing_y/y_r
+    psz = slicethickness_z/z_r
+    
+    # print(psx)
+    # print(psy)
+    # print(psz)
+    
+    xr = int(np.round(patient_CT.shape[0]*psx))
+    yr = int(np.round(patient_CT.shape[1]*psy))
+    zr = int(np.round(patient_CT.shape[2]*psz))
+    
+    aliasing = False
+    if x_r < pixelspacing_x:
+        aliasing = True
+    
+
+    print("Regridding CT of patient " + str(npat))
+    X_r = resize(patient_CT,(xr,yr,zr),anti_aliasing=aliasing)
+    
+    D_r = 0
+    # if not patient_RD == 0:
+    #     print("Regridding RD of patient " + str(npat))
+    #     D_r = resize(patient_RD,(xr,yr,zr),anti_aliasing=aliasing)
+
+    Y_r_dim1 = X_r.shape[0]; Y_r_dim2 = X_r.shape[1];
+    Y_r_dim3 = X_r.shape[2]; Y_r_dim4 = patient_RS.shape[-1];
+    
+    print("Regridding RS of patient " + str(npat))
+    Y_r = np.zeros((Y_r_dim1, Y_r_dim2, Y_r_dim3, Y_r_dim4))
+    for label in np.arange(len(selected_structures)):
+        print("Label " + str(label+1) + "/" + str(len(selected_structures)))
+        
+        struct_ind = values_dict[selected_structures[label]]-1
+        
+        # print("Struct_ind: " + str(struct_ind))
+        
+        # print("Y # elements for label " + str(label) + ": " + str(collections.Counter(patient_RS[:,:,:,label].ravel())))
+        
+        Y_r[:,:,:,struct_ind] = resize(patient_RS[:,:,:,struct_ind],(xr,yr,zr),mode='constant',anti_aliasing=aliasing)
+        Y_r[:,:,:,struct_ind] = (Y_r[:,:,:,struct_ind] > 0.5).astype(float)
+          
+    print("")
+    
+    return X_r, Y_r, D_r
+
+
+def crop_wide(input_CT, input_RS, input_RD, spacing):
+    
+    global values_dict
+    
+    structo = 'SpinalCord'
+    if input_RD != 0:
+        structo = 'Body'
+    
+    A = np.where(input_RS[:,:,:,values_dict[structo]-1] == 1)
+    
+    print(structo)
+    
+    margins_x = [176*spacing[0],88*spacing[0]]
+    margins_y = [120*spacing[1],120*spacing[1]]
+    margins_z = [168*spacing[2],200*spacing[2]]
+    
+    x0 = np.max((int(np.mean(A[0])) - int(margins_x[0]/spacing[0]),0))
+    x1 = np.min((int(np.mean(A[0])) + int(margins_x[1]/spacing[0]),input_CT.shape[0]))
+    
+    y0 = np.max((int(np.mean(A[1])) - int(margins_y[0]/spacing[1]),0))
+    y1 = np.min((int(np.mean(A[1])) + int(margins_y[1]/spacing[1]),input_CT.shape[1]))
+    
+    z0 = np.max((int(np.mean(A[2])) - int(margins_z[0]/spacing[2]),0))
+    z1 = np.min((int(np.mean(A[2])) + int(margins_z[1]/spacing[2]),input_CT.shape[2]))
+    
+    CT_new = input_CT[x0:x1,y0:y1,z0:z1]
+    RS_new = input_RS[x0:x1,y0:y1,z0:z1,:]
+    
+    RD_new = 0
+    if not input_RD == 0:
+        RD_new = input_RD[x0:x1,y0:y1,z0:z1]
+    
+    #for slice_ind in np.arange(CT_new.shape[-1]):
+#    plt.figure(figsize=(9,9)); slice_ind = 0
+#    plt.imshow(CT_new[:,:,slice_ind],cmap='gray')
+#    plt.imshow(RS_new[:,:,slice_ind,values_dict['SpinalCord']-1],cmap='jet',alpha=0.5)
+    
+    return CT_new, RS_new, RD_new
+
+ 
+def reduce_image(input_image, clip_value):
+
+    if clip_value > 0:
+        print("Pre downsample image shape: " + str(input_image.shape))
+        
+        clip = np.round(1-(20-clip_value)/20,2)
+        
+        x1 = int(input_image.shape[0]*clip)
+        x2 = int(input_image.shape[0]*(1-clip))
+        
+        y1 = int(input_image.shape[1]*clip)
+        y2 = int(input_image.shape[1]*(1-clip))
+        
+        z1 = int(input_image.shape[2]*clip)
+        z2 = int(input_image.shape[2]*(1-clip))
+        
+        if len(input_image.shape) > 3:
+            output_image = input_image[x1:x2,y1:y2,z1:z2,:]
+        else:
+            output_image = input_image[x1:x2,y1:y2,z1:z2]
+        
+        print("Post downsample image shape: " + str(output_image.shape))
+    else:
+        output_image = input_image
+    
+    return output_image
+
+def get_rd_image(CTs, RDs, CT_volume, presentation=1):
+    """
+    This function will transform the contour data in a np array image of the RD dose for 
+    your queried structures for a given patient
+
+
+    @param presentation: How to present the data
+    0: off, 1:show, 2:save, 3:save RD data
+
+    """
+    
+    global npat
+
+    CTs = sorted(CTs, key=lambda ct: float(ct.SliceLocation))
+    CT = CTs[0]
+    RD = RDs[0]
+
+    assert CT.ImageOrientationPatient == RD.ImageOrientationPatient
+
+    nr_slices = len(CTs)
+
+    spacing_x, spacing_y = [float(ps) for ps in CT.PixelSpacing]
+    spacing_z = float(CT.SliceThickness)
+    
+    result = np.zeros_like(CT_volume)
+    result = np.zeros(np.array(CT_volume.shape) + 10)
+ 
+    CT_equal_spaced_shape = (
+        round(CT.Rows * spacing_x),    #512, 0.9765 -> 500, 98 * 3 -> 300
+        round(CT.Columns * spacing_y), #512, 
+        round(nr_slices * spacing_z)
+    )
+
+    # Read the rd_data
+    rd_data = RD.pixel_array
+    rd_data = rd_data.transpose(1,2,0) # change (z, x, y) -> (x, y, z)
+
+    """
+    align the image position patient, match the pixal spacing
+    find the max dose in dicom file, e.g. ~80 and <120
+    """
+
+    rd_spacing_x, rd_spacing_y = [float(ps) for ps in RD.PixelSpacing]
+
+    if not RD.SliceThickness:
+        rd_slice_locations = np.array(RD.GridFrameOffsetVector)
+        RD.SliceThickness = np.unique(rd_slice_locations[1:] - rd_slice_locations[:-1])[0]
+
+    rd_spacing_z = float(RD.SliceThickness)
+ 
+    rd_x_dim = int(rd_data.shape[0] * rd_spacing_x / spacing_x)
+    rd_y_dim = int(rd_data.shape[1] * rd_spacing_y / spacing_y)
+    rd_z_dim = int(rd_data.shape[2] * rd_spacing_z / spacing_z)
+
+    rd_data_new = rd_data * float(RD.DoseGridScaling)
+    rd_data_new = resize(rd_data_new, (rd_x_dim, rd_y_dim, rd_z_dim))
+ 
+
+    ct_slices = np.array(sorted(float(ct.SliceLocation) for ct in CTs))
+    z_offset = np.argmax(ct_slices >= RD.ImagePositionPatient[2])
+ 
+
+    RD_img = RD.pixel_array
+
+
+    CTpsx = float(CT.PixelSpacing[0]); CTpsy = float(CT.PixelSpacing[1])
+    CTpos = CT.ImagePositionPatient
+    RDpos = RD.ImagePositionPatient
+
+    A = int(abs((float(CTpos[0]) - float(RDpos[0]))/CTpsx))
+    B = int(abs((float(CTpos[1]) - float(RDpos[1]))/CTpsy))
+
+
+    offsetud = B; offsetlr = A
+    Upad = offsetud
+    Dpad = offsetud + 50
+    Lpad = offsetlr
+    Rpad = offsetlr + 50
+
+
+    RD_img = np.pad(rd_data_new,(
+                                    (Upad,Dpad),
+                                    (Lpad,Rpad),
+                                    (0,0)
+                                )
+
+                    )#,mode='nearest')
+
+    RD_img2 = np.pad(RD_img,(
+                                (0,int(abs(CT_volume.shape[0]-RD_img.shape[0]))),
+                                (0,0),
+                                (0,0)
+                            )
+                    )
+
+    result = RD_img2[:CT_volume.shape[0],:CT_volume.shape[1],:]
+
+    return result
+
+def norm(ct):
+    ct = ct + abs(np.min(ct))
+    ct = ct / np.max(ct)
+    # ct = ct > 0
+    return ct
+
+
+def clip_CT(inp,cap_min,cap_max):
+
+    mask1 = (inp < cap_min)# & (A > 500)
+    mask2 = (inp > cap_max)
+    inp[mask1] = cap_min
+    inp[mask2] = cap_max
+    
+    return inp
+
+
+#%%
+
+"""
+Considering C is a list of strings that contain the paths to .npy files of the CT and structure sets
+"""
+
+trans_z = np.zeros(len(C)).astype(int)
+
+"""
+arbitrary values:
+"""
+
+fs2=14; fs1 = 12; fs3 = 11; fs0 = 12; color = 'k'
+for k in np.arange(len(C)):
+    
+    print(k)
+    
+    save_dir = C[k]
+    
+    CT = np.load(A[k])
+    RS = np.load(B[k])
+    
+    CT = np.swapaxes(CT,0,1)
+    RS = np.swapaxes(RS,0,1)
+
+
+    CT2 = CT.copy()
+    
+    P0 = np.sum(np.sum(CT2,axis=0),axis=1)/(CT2.shape[-1]*CT2.shape[-2])
+    plt.figure(figsize=(9,5.6))
+    plt.imshow(np.rot90(np.mean(CT2,axis=0)),cmap='gray')
+    plt.contourf(np.rot90(np.mean(RS[:,:,:,2],axis=0)>0),cmap=cmap_cont2)#,alpha=0.5)
+    plt.contourf(np.rot90(np.mean(RS[:,:,:,3],axis=0)>0),cmap=cmap_cont2)#,alpha=0.5)
+    
+
+    plt.title("Axial Hounsfield Unit summation",fontsize=fs2)
+    plt.xlabel("Sagittal axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+    plt.ylabel("Axial axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+
+    
+    plt.twinx()
+    plt.plot(P0,color='red',label='H')
+    plt.plot(np.diff(P0),color='red',linestyle='dashed',label='$\Delta$H')
+    plt.axhline(np.std(np.diff(P0)),color='red',linestyle='dotted',label='+1 $\sigma$($\Delta$H)')
+    plt.ylabel("Average Hounsfield Units",color='red',fontsize=fs2)
+    plt.legend(loc='lower left',fontsize=fs0)            
+    plt.tick_params(labelsize=fs3)
+    plt.savefig(save_dir + '/coronalprojection1.png',dpi=1200,bbox_inches='tight')
+
+
+    
+    sl = np.where(np.diff(P0[150:])>np.std(np.diff(P0[150:])))[0][0]
+    sl += 150
+    
+    CT3 = np.rot90(CT2.copy(),axes=(1,0))
+    RS3 = np.zeros((CT3.shape[0],CT3.shape[1],CT3.shape[2],4))
+    
+    """
+    S = number of structures in the dataset (e.g. 2, in case of 2 parotids left  + right)
+                                             """
+    
+    S = 4
+    for b in np.arange(S):
+        RS3[:,:,:,b] = np.rot90(RS[:,:,:,b],axes=(1,0))
+    # plt.close()
+    
+    CT3[sl:,:,:] = -1000
+            
+    P1 = np.sum(np.sum(CT3,axis=0),axis=0)/(CT3.shape[1]*CT3.shape[2])
+    ref_z = np.where(P1[len(P1)//2:] == np.max(P1[len(P1)//2:]))[0][0]+len(P1)//2+30
+    
+    CTA = CT3>-300#CR3np.clip(CT3,0,300)
+    P1A = np.sum(np.sum(CTA,axis=0),axis=0)/(CTA.shape[1]*CTA.shape[2])
+    
+    lim1 = np.where(np.diff(P1A) == np.min(np.diff(P1A)))[0][0]
+    lim1 = np.where(P1A[:int(len(P1)*0.75)] == np.min(P1A[:int(len(P1)*0.75)]))[0][0]
+    lim2 = P1A[len(P1A)//2]
+    
+    
+    ref_z = np.where(P1A[lim1:] == np.max(P1A[lim1:]))[0][0]+lim1
+    P1 = P1A
+
+    tmp = 0
+    for ii in np.arange(CT3.shape[-1]):
+        if (CT3[:,CT3.shape[1]//2,ii].ravel()>-500).sum() > 0:
+            tmp = ii
+
+
+    plt.figure(figsize=(6,9))
+    plt.imshow(np.mean(CT3,axis=-2),cmap='gray')
+    # plt.contourf(np.mean(RS3[:,:,:,0],axis=-2)>0,cmap=cmap_cont1,label='SMG reference projection')
+    # plt.contourf(np.mean(RS3[:,:,:,1],axis=-2)>0,cmap=cmap_cont1)
+    plt.contourf(np.mean(RS3[:,:,:,2],axis=-2)>0,cmap=cmap_cont2,label='PG reference projection')
+    plt.contourf(np.mean(RS3[:,:,:,3],axis=-2)>0,cmap=cmap_cont2)
+    plt.title("Sagittal Hounsfield Unit summation" + str(k),fontsize=fs2)
+    plt.xlabel("Axial axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+    plt.ylabel("Sagittal axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+    
+    plt.twinx()
+    plt.plot(P1,color='red',label='H')
+
+    Z = 192
+    
+    ax1 = tmp-40+trans_z[k]; 
+    ax1 = np.min([ref_z+30,len(P1)]); ax2 = ax1-Z
+    
+    print(ax2)
+    print(ax1)
+
+    if ax2 < 0:
+        ax2 += abs(ax2) + trans_z[k]
+        ax1 = ax2 + Z
+    
+    plt.ylabel("Average Hounsfield Units",color='red',fontsize=fs2)
+    plt.tick_params(labelsize=fs3)
+    plt.axvline(ax1,color=color,linestyle='solid',label='Cranial FOV borders')
+    plt.axvline(ref_z,color=color,linestyle='dashdot',label='Cranial FOV reference')
+    plt.axvline(ax2,color=color)
+    # plt.axvline(ax2,color='green')
+    plt.legend(loc='lower left',fontsize=fs0)
+    plt.savefig(save_dir + '/coronalprojection2.png',dpi=1200,bbox_inches='tight')
+
+
+    CTc = CT3.copy()
+    CTc = CTc[:,:,ax2:ax1]
+    RSc = RS3[:,:,ax2:ax1,:]
+    
+    
+    plt.figure(figsize=(10.5,3.75))
+    plt.imshow(np.rot90(CTc[:,CTc.shape[1]//2,:]),cmap='gray')
+    # plt.imshow(np.rot90(np.mean(CTc,axis=-2)),cmap='gray')
+    plt.title("Sagittal Hounsfield Unit summation",fontsize=fs2)
+    plt.xlabel("Sagittal axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+    plt.ylabel("Axial axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+    
+    P2 = np.sum(CTc[:,CTc.shape[1]//2,:],axis=1)/(Z)
+    # P2 = np.sum(np.sum(CTc,axis=1),axis=1)/(506*176)
+    
+    tmp = np.min(np.where(P2>-950))
+    
+    
+    cor1 = np.max([0,tmp-10]); cor2 = cor1+192
+    
+    plt.twinx()
+    plt.plot(P2,color='red',label='H')
+    plt.axvline(tmp,color=color,linestyle='dashdot',label='Sagittal FOV reference')
+    plt.axvline(cor1,color=color,label='Sagittal FOV borders')
+    plt.axvline(cor2,color=color)
+    plt.ylabel("Average Hounsfield Units",color='red',fontsize=fs2)
+    plt.tick_params(labelsize=fs3)
+    plt.legend(loc='lower right',fontsize=fs0)
+    
+    plt.savefig(save_dir + '/coronalprojection3.png',dpi=1200,bbox_inches='tight')
+    # plt.close()
+    
+    CTc2 = CT3.copy()
+    CTc2 = CTc2
+    
+    plt.figure(figsize=(10,6.2))
+    plt.imshow(np.rot90(np.mean(CTc2,axis=0)),cmap='gray')
+    plt.title("Coronal Hounsfield Unit summation",fontsize=fs2)
+    plt.xlabel("Coronal axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+    plt.ylabel("Axial axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+    
+    plt.twinx()
+    P3 = np.sum(np.rot90(np.mean(CTc2,axis=0)),axis=0)/(306)
+    plt.plot(P3,color='red',label='H')
+    
+    
+    a=np.min(P3)+(np.max(P3)-np.min(P3))*(9/10)
+    
+    corref = int(np.median(np.where(P3>a)))
+    
+    sag1 = corref-96; sag2 = corref+96
+    
+    dumm = np.arange(sag1,sag2)
+    
+    # plt.axhline(a,color='green',linestyle='dashdot')
+    plt.plot(dumm,[a]*len(dumm),color=color,linestyle='dashdot')
+    plt.axhline([np.min(P3)+(np.max(P3)-np.min(P3))],color='red',linestyle='dashdot')
+    plt.axhline(np.min(P3),color='red',linestyle='dashdot',label='Range H')
+    plt.axvline(corref,color=color,linestyle='dashdot',label='Lateral FOV reference')
+    plt.axvline(corref-96,color=color,label='Lateral FOV borders')
+    plt.axvline(corref+96,color=color)
+    plt.ylabel("Average Hounsfield Units",color='red',fontsize=fs2)
+    plt.tick_params(labelsize=fs3)
+    plt.legend(loc='lower right',fontsize=fs0)
+    
+    plt.savefig(save_dir + '/sagittalprojection3.png',dpi=1200,bbox_inches='tight')
+    # plt.close()
+    
+    CTC = CT3.copy()
+    CTC = CTC[cor1:cor2,sag1:sag2,ax2:ax1]
+    # RSC = np.rot90(RS2[cor1:cor2,sag1:sag2,:,:],axes=())
+    RSC = RS3[cor1:cor2,sag1:sag2,ax2:ax1,:]
+
+    plt.figure(figsize=(8,7.5))
+    plt.imshow(np.mean(CTC,axis=-1),cmap='gray')
+    plt.contourf(np.mean(RSC[:,:,:,2],axis=-1)>0,cmap=cmap_cont2,label='PG reference projection')
+    plt.contourf(np.mean(RSC[:,:,:,3],axis=-1)>0,cmap=cmap_cont2,label='PG reference projection')
+
+
+    plt.xlabel("Coronal axis",fontsize=fs1)
+    plt.tick_params(labelsize=fs3)
+    plt.ylabel("Sagittal axis",fontsize=fs0)
+    plt.tick_params(labelsize=fs3)
+    plt.twinx()
+    plt.axvline(CTC.shape[1]//2,color=color,label="Left/right FOV border")
+
+    plt.ylim([0,1])
+    plt.axis('off')
+    plt.legend(loc='lower right',fontsize=fs0)
+    plt.savefig(save_dir + '/axialprojection.png',dpi=1200,bbox_inches='tight')
+
+    """
+    Window-level the CT between -200 and 300 HUs
+    """
+
+    CTC = clip_CT(CTC,-200,300)
+    
+    if RSC[:,96:,:,1].astype(bool).sum() > 0:
+        np.save(save_dir + '/X1.npy',np.flip(CTC[:,96:,:].astype(np.short),axis=1))
+        np.save(save_dir + '/Y1a.npy',np.flip(RSC[:,96:,:,1].astype(bool),axis=1))
+        
+    if RSC[:,:96,:,0].astype(bool).sum() > 0:
+        np.save(save_dir + '/X2.npy',CTC[:,:96,:].astype(np.short))
+        np.save(save_dir + '/Y2a.npy',RSC[:,:96,:,0].astype(bool))
+        
+    
