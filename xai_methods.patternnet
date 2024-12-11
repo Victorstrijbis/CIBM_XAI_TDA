@@ -1,0 +1,328 @@
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.autograd import Variable
+import copy
+from skimage.measure import regionprops
+
+from tqdm import tqdm
+
+
+def safe_divide(a, b):
+    return a / (b + (b == 0).float())
+
+def isnan(x):
+    return x != x
+
+def breadcast(a, b):
+    # prepare tensor a to be broadcasted with tensor b by adding empty dimensions at the end
+    for i in range(len(b.size()) - len(a.size())):
+        a = a[..., None]
+    return a
+
+def outer_prod_along_batch(a, b):
+    # outer product of two vectors where 0th dimension is batch
+    # a is (n_batch, n)
+    # b is (n_batch, m)
+    # out must be (n_batch, n, m)
+    return a[:, :, None] @ b[:, None, :]
+
+def normalise(x):
+    denom = torch.max(abs(x).view(x.size(0), -1), dim=1, keepdim=True)[0]
+    return x / breadcast(denom, x)
+
+class PatternNetSignalEstimator(object):
+    def __init__(self, model, weights_path):
+        # the model is your CNN that you use for segmentation
+        # here I just make a copy of the model and load the weights from a checkpoint
+        self.model = copy.deepcopy(model)
+        self.model.load_state_dict(torch.load(weights_path)['state_dict'])
+        #self.model.cpu()
+        self.top_modules = [self.model]
+        # this is some initializations to modify the model according to the PatternNet paper
+        self.module_list, self.relu_module_list = self.prepare_for_correlation_stats()
+        
+    # initialization function for appling PatternNet changes
+    def prepare_for_correlation_stats(self):
+        
+        def make_info_collector(layer, module_list):
+            def modify_forward(forward_fn):
+                def forward_info_collector(x):
+                    # save the input and the output of the operation the layer performs
+                    # so that we can use it later
+                    layer.inp = x
+                    x = forward_fn(x)
+                    layer.outp = x
+                    return x
+                return forward_info_collector
+
+            if isinstance(layer, nn.Conv2d) or isinstance(layer, nn.Conv3d) or isinstance(layer, nn.Linear):
+                # initialise running means (Expected value of x, y and xy)
+                layer.Ex_plus = torch.zeros_like(layer.weight).to(layer.weight.device).view(-1, layer.out_channels)
+                layer.Ex_minus = torch.zeros_like(layer.weight).to(layer.weight.device).view(-1, layer.out_channels)
+                layer.Ey = torch.zeros(layer.weight.size(0)).to(layer.weight.device) # init as floatTensor sometimes inits it with NaN values. wtf is that about
+                layer.Exy_plus = torch.zeros_like(layer.Ex_plus).to(layer.weight.device)
+                layer.Exy_minus = torch.zeros_like(layer.Ex_minus).to(layer.weight.device)
+                layer.n_plus = torch.zeros(1, layer.weight.size(0)).to(layer.weight.device)
+                layer.n_minus = torch.zeros(1, layer.weight.size(0)).to(layer.weight.device)
+                layer.n_all = torch.zeros(1, layer.weight.size(0)).to(layer.weight.device)
+
+                # modify forward function so as to save input-output pairs
+                layer.forward = modify_forward(layer.forward)
+                module_list.append(layer)
+                
+            return layer
+       
+        def make_info_collector_model(module, module_list):    
+            for idx, layer in module._modules.items():
+                module_list = make_info_collector_model(layer, module_list)
+                layer = make_info_collector(layer, module_list)
+            
+            return module_list
+        
+        module_list = []
+        for module in self.top_modules:
+            layer = make_info_collector(module, module_list)
+            module_list = make_info_collector_model(module, module_list)
+            
+            
+        def hook(module, grad_input, grad_output):            
+            return tuple(F.relu(grad) for grad in grad_output)
+            
+        def recursive_relu_apply(module_list, module_top):            
+            for idx, module in module_top._modules.items():
+                recursive_relu_apply(module_list, module)
+                if module.__class__.__name__ == 'ReLU':
+                    # module_top._modules[idx].register_backward_hook(hook) # uncommented
+                    module_list.append(module_top._modules[idx])
+            
+            return module_list
+                    
+        relu_top_modules = [self.model]
+        # replace ReLU with GuidedBackpropReLU
+        relu_module_list = []
+        
+        for m in relu_top_modules:
+            relu_module_list = recursive_relu_apply(relu_module_list, m)
+        
+        return module_list, relu_module_list
+
+   
+    # function that modifies the model's weights to run PatternNet
+    def get_E(self, layer, x, y, mask):
+        y_masked = y * mask
+       
+        padding = layer.padding
+        padding_mode = layer.padding_mode
+        if padding_mode == 'zeros':
+            padding_mode = 'constant'
+            
+        kw, kh, kd = layer.kernel_size
+        stride = layer.stride[0]
+        n_out_channels = layer.out_channels
+       
+        # reshape input       
+        x = F.pad(x, padding + padding, padding_mode).unfold(2, kh, stride).unfold(3, kw, stride).unfold(4, kd, stride)
+        bs, c, h, w, d, *_ = x.shape
+        
+        x = x.permute(0, 2, 3, 4, 1, 5, 6, 7).contiguous()
+        x = x.view(-1, c*kh*kw*kd)
+        
+                
+        def reshape_output(o, n_channel_out):
+            o = o.permute(0, 2, 3, 4, 1).contiguous()
+            return o.view(-1, n_channel_out)
+        
+        y = reshape_output(y, n_out_channels)
+        y_masked = reshape_output(y_masked, n_out_channels)
+        mask = reshape_output(mask, n_out_channels)
+            
+       
+        n  = mask.sum(axis=0, keepdims=True)
+        n_all = torch.ones_like(mask).sum(axis=0, keepdims=True)
+        
+        x_mean  = safe_divide(x.t() @ mask, n)
+        xy_mean = safe_divide(x.t() @ y_masked, n)
+        y_mean  = safe_divide(y.sum(0), n_all)
+               
+        return n, n_all, x_mean, y_mean, xy_mean
+
+    # function that modifies the model's weights to run PatternNet
+    def update_E_for_layer(self, layer, 
+                           ex_minus, ex_plus, 
+                           ey, 
+                           exy_minus, exy_plus, 
+                           n_minus, n_plus, n_all):
+        # for the E-values of a particular layer
+        # adds this batch's contribution
+        # to the running mean
+        def update(layer_mean, layer_n, new_mean, new_n):
+            new_factor = safe_divide(new_n, layer_n)
+            old_factor = 1 - new_factor
+            
+            layer_mean = layer_mean * old_factor + new_mean * new_factor
+            
+            return layer_mean
+                  
+        layer.n_minus += n_minus
+        layer.n_plus += n_plus
+        layer.n_all += n_all
+        
+        layer.Ex_minus = update(layer.Ex_minus, layer.n_minus, ex_minus, n_minus)
+        layer.Ex_plus = update(layer.Ex_plus, layer.n_plus, ex_plus, n_plus)
+        layer.Ey = update(layer.Ey, layer.n_all, ey, n_all)
+        layer.Exy_minus = update(layer.Exy_minus, layer.n_minus, exy_minus, n_minus)
+        layer.Exy_plus = update(layer.Exy_plus, layer.n_plus, exy_plus, n_plus)
+        
+        
+    # function that modifies the model's weights to run PatternNet
+    def update_E(self, image):
+        # processes an item
+        # for each layer in the network, keep track of in and output that each filter performs
+        # use that info to update the expected values needed to compute attribution of that layer
+        _ = self.model(image)
+        for i, layer in enumerate(self.module_list[:]):
+            #print(i)            
+            if isinstance(layer, nn.Conv3d):
+                # mask = torch.ones(layer.outp.shape).to(layer.weight.device) # un commented
+                mask_minus = (layer.outp < 0).float() 
+                mask_plus = (layer.outp >= 0).float() 
+                
+                y_wo_bias = layer.outp
+                if layer.bias is not None:
+                    y_wo_bias -= layer.bias.view(-1, 1, 1, 1)
+                n_minus, n_all, ex_minus, ey, exy_minus = self.get_E(layer, layer.inp, y_wo_bias, mask_minus)                
+                n_plus, n_all, ex_plus, ey, exy_plus = self.get_E(layer, layer.inp, y_wo_bias, mask_plus)                
+
+                self.update_E_for_layer(layer, ex_minus, ex_plus, ey.sum(0), 
+                                        exy_minus, exy_plus, n_minus, n_plus, n_all)
+                
+                
+    # function that modifies the model's weights to run PatternNet            
+    def get_patterns(self):
+        # calculates the patterns a for each of the neurons in the network
+        # and replaces the weights with the patterns
+        # signal estimation can now be performed with a simple backward pass
+        # only call this when E-values are based on a full epoch
+        for layer in self.module_list:
+            if isinstance(layer, nn.Conv3d) or isinstance(layer, nn.Linear):
+                Ex_minus = layer.Ex_minus
+                Ex_plus = layer.Ex_plus
+                Ey = layer.Ey
+                Exy_minus = layer.Exy_minus
+                Exy_plus = layer.Exy_plus
+                Ex_minus[isnan(Ex_minus)] = 0
+                Ex_plus[isnan(Ex_plus)] = 0
+                Ey[isnan(Ey)] = 0
+                Exy_minus[isnan(Exy_minus)] = 0
+                Exy_plus[isnan(Exy_plus)] = 0
+                
+                ExEy_minus = Ex_minus * Ey
+                ExEy_plus = Ex_plus * Ey
+                
+                W = layer.weight.view(layer.out_channels, -1)
+
+                cov_xy_minus = Exy_minus - ExEy_minus
+                cov_xy_plus = Exy_plus - ExEy_plus
+                
+                w_cov_xy_minus = torch.diag(W @ cov_xy_minus)
+                w_cov_xy_plus = torch.diag(W @ cov_xy_plus)
+                
+                a_minus = safe_divide(cov_xy_minus, w_cov_xy_minus[None, :])
+                a_plus = safe_divide(cov_xy_plus, w_cov_xy_plus[None, :])
+                
+                a_minus = a_minus.view(W.t().shape)
+                a_minus = a_minus.t().contiguous()                
+                a_minus = a_minus.view(layer.weight.shape)                
+                a_plus = a_plus.view(W.t().shape)
+                a_plus = a_plus.t().contiguous()                
+                a_plus = a_plus.view(layer.weight.shape)
+                
+                a_minus[isnan(a_minus)] = 0
+                a_plus[isnan(a_plus)] = 0
+                layer.a_minus = nn.Parameter(a_minus)
+                layer.a_plus = nn.Parameter(a_plus)
+                layer.weight_store = copy.deepcopy(layer.weight)
+
+        # log various stuff to a history txt file?
+
+
+    def assign_patterns_for_signal(self):
+        for layer in self.module_list:
+            if isinstance(layer, nn.Conv3d) or isinstance(layer, nn.Linear):
+                layer.weight.data.copy_(layer.a_plus / 10)
+
+    def assign_patterns_for_attribution(self):
+        for layer in self.module_list:
+            if isinstance(layer, nn.Conv3d) or isinstance(layer, nn.Linear):
+                layer.weight.data.copy_((layer.a_plus) * layer.weight_store)
+
+    def restore_weights(self):
+        for layer in self.module_list:
+            if isinstance(layer, nn.Conv3d) or isinstance(layer, nn.Linear):
+                layer.weight.data.copy_(layer.weight_store)
+                
+                
+    # same function as __call__ from GuidedBackpropagation and LRP
+    def forward_backward(self, image, replace_weight_fn):
+        # ask the network what evidence it has for predicting class c (n_batch integers)
+        # if no c is given, pick the most probable class
+        self.restore_weights()
+        
+        si = Variable(image, requires_grad = True)
+
+        # run model
+        y_pred = self.model(si)
+        y_pred = y_pred[0,:,:,:,:] 
+        y_pred_sigmoid = torch.sigmoid(y_pred).detach().cpu().numpy()
+        
+        maps = []
+        
+        replace_weight_fn()
+        for i in range(y_pred.shape[0]):
+            idxs = (y_pred_sigmoid[i] >= 0.5)
+            fg = y_pred[i][idxs]
+            print(fg)
+            val = torch.sum(fg)
+            
+            val.requires_grad_(True)  
+            val.backward(retain_graph=True)          
+
+            output = si.grad.cpu().data.numpy()[0]
+            output = (output - np.min(output)) / (np.max(output)-np.min(output))
+            
+            si.grad = None
+            self.model.zero_grad()
+            
+            maps.append(output)      
+        
+        
+        self.restore_weights()
+        
+       
+        return np.stack(maps, axis=1)
+    
+    # run to get the signal heatmap
+    def get_signal(self, image):
+        return self.forward_backward(image, self.assign_patterns_for_signal)
+    
+    # run to get the attribution heatmap (this is what you mostly want)
+    def get_attribution(self, image):
+        return self.forward_backward(image, self.assign_patterns_for_attribution)
+        
+    
+"""
+pnet = PatternNetSignalEstimator(net, checkpoint)
+with torch.no_grad():
+    for inputs in tqdm(data_loader):
+        pnet.update_E(inputs['image'].cuda())
+pnet.get_patterns()
+
+signal = pnet.get_signal(image.cpu())
+attribution = pnet.get_attribution(image.cuda())
+
+post_maps_patt_attr = utils.process_attributions(attribution[0, 0]+attribution[0, 1], img[0, 0], True)
+
+"""
+
