@@ -1,0 +1,107 @@
+import numpy as np
+import torch
+import copy
+from lrp_conv import Conv3d
+import torch.nn.functional as F
+import psutil
+
+
+
+
+class LRPModel:
+    def __init__(self, model, weights_path):
+        # the model is your CNN that you use for segmentation
+        # here I just make a copy of the model and load the weights from a checkpoint
+        self.model = copy.deepcopy(model)
+        self.model.load_state_dict(torch.load(weights_path)['state_dict'])
+        self.model.cuda()
+        
+        # this is the function that applies ReLU 
+        #to the gradients during backpropagation
+        def hook(module, grad_input, grad_output):            
+            return tuple(F.relu(grad) for grad in grad_input)
+        
+        # you apply the hook function to ReLU layers
+        # you change the Conv3d layers to compute the gradients according to the LRP paper
+        def recursive_module_apply(module_list, module_top, rule):            
+            for idx, module in module_top._modules.items():
+                recursive_module_apply(module_list, module, rule)
+                # print(idx)
+                if module.__class__.__name__ == 'ReLU':
+                    # module_top._modules[idx].register_backward_hook(hook) # un commenten
+                    module_list.append(module_top._modules[idx])
+                
+                if isinstance(module, torch.nn.Conv3d):
+                    module_top._modules[idx] = Conv3d.from_torch(module, rule)
+                    module_list.append(module_top._modules[idx])                
+            
+            return module_list
+                
+        self.bottom_modules = [self.model]
+        # replace ReLU with GuidedBackpropReLU
+        self.module_list = []
+        
+        # apply changes to different layers in your model
+        for m in self.bottom_modules:
+            self.module_list = recursive_module_apply(self.module_list, 
+                                                      m, 
+                                                      rule='gradient')
+     
+    
+    # this is the exact same function as in GuidedBackpropagation         
+    def __call__(self, image):        
+        image = image.requires_grad_(True)
+
+        y_pred = self.model(image)
+        y_pred = y_pred[0,:,:,:,:] 
+        y_pred_sigmoid = torch.sigmoid(y_pred).detach().cpu().numpy()
+        
+        
+        maps = []
+        for i in range(y_pred_sigmoid.shape[0]):
+            idxs = (y_pred_sigmoid[i] >= 0.5)
+            # print(idxs.sum())
+            
+            # centroid = np.array([np.mean(np.where(idxs>0)[-3]),np.mean(np.where(idxs>0)[-2]),np.mean(np.where(idxs>0)[-1])]).astype(int)
+            # # tc = np.where(y_pred_sigmoid[i]>0.5)
+            # idxs = np.zeros((176,96,176)).astype(bool)
+            # idxs[centroid[0],centroid[1],centroid[2]] = True
+            
+            # tc = np.where(y_pred_sigmoid[i]>0.5)
+            print(idxs.sum())
+            # Z = np.zeros(y_pred_sigmoid[i].shape)
+            # Z[tc[0][-1],tc[1][-1],tc[2][-1]] = True
+            # idxs = Z.astype(bool)
+            
+            # print()
+            
+            fg = y_pred[i][idxs]
+            val = torch.sum(fg)
+
+            # print(val)
+            val.requires_grad_(True)  
+            # print(val)
+            val.backward(retain_graph=True)   
+            # print(val)
+
+            output = image.grad.cpu().data.numpy()[0]
+            output = (output - np.min(output)) / (np.max(output)-np.min(output))
+            
+            image.grad = None
+            
+            maps.append(output)        
+        
+        return np.stack(maps, axis=1)
+    
+
+    
+"""
+
+lrp_model = LRPModel(net, checkpoint)
+lrp_maps = lrp_model(image)
+
+post_maps_lrp = utils.process_attributions(lrp_maps[0, 0]+lrp_maps[0, 1], img[0, 0], True)
+
+"""
+
+
