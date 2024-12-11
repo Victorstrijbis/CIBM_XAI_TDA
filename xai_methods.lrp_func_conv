@@ -1,0 +1,284 @@
+import torch
+import torch.nn.functional as F
+from torch.autograd import Function
+
+from lrp_func_utils import identity_fn, gamma_fn, add_epsilon_fn
+import lrp_trace as trace
+
+def _forward_rho_2d(rho, incr, ctx, input, weight, bias, stride, padding, dilation, groups):
+        ctx.save_for_backward(input, weight, bias)
+        ctx.rho = rho
+        ctx.incr = incr
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.dilation = dilation
+        ctx.groups = groups
+
+        Z = F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+        return Z
+
+def _backward_rho_2d(ctx, relevance_output):
+    input, weight, bias    = ctx.saved_tensors
+
+    weight, bias     = ctx.rho(weight, bias)
+    Z                = ctx.incr(F.conv2d(input, weight, bias, ctx.stride, ctx.padding, ctx.dilation, ctx.groups))
+
+    relevance_output = relevance_output / Z
+    
+    if ctx.stride[0] >=2:
+        output_padding = 1
+    else:
+        output_padding = 0
+                
+    relevance_input  = F.conv_transpose2d(relevance_output, weight, None, padding=ctx.padding)
+    relevance_input  = relevance_input * input
+
+    trace.do_trace(relevance_input) 
+    return relevance_input, None, None, None, None, None, None, 
+
+
+
+class Conv2DEpsilon(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _forward_rho_2d(identity_fn, add_epsilon_fn(1e-1), ctx, input, weight, bias, stride, padding, dilation, groups)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _backward_rho_2d(ctx, relevance_output)
+
+class Conv2DGamma(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _forward_rho_2d(gamma_fn(0.1), add_epsilon_fn(1e-10), ctx, input, weight, bias, stride, padding, dilation, groups)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _backward_rho_2d(ctx, relevance_output)
+
+class Conv2DGammaEpsilon(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _forward_rho_2d(gamma_fn(0.1), add_epsilon_fn(1e-1), ctx, input, weight, bias, stride, padding, dilation, groups)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _backward_rho_2d(ctx, relevance_output)
+
+def _conv_alpha_beta_forward_2d(ctx, input, weight, bias, stride, padding, dilation, groups, **kwargs): 
+    Z = F.conv2d(input, weight, bias, stride, padding, dilation, groups)
+    ctx.save_for_backward(input, weight, Z,  bias)
+    ctx.stride = stride
+    ctx.padding = padding
+    
+    return Z
+
+def _conv_alpha_beta_backward_2d(alpha, beta, ctx, relevance_output):
+        input, weights, Z, bias = ctx.saved_tensors
+        sel = weights > 0
+        zeros = torch.zeros_like(weights)
+
+        weights_pos       = torch.where(sel,  weights, zeros)
+        weights_neg       = torch.where(~sel, weights, zeros)
+
+        input_pos         = torch.where(input >  0, input, torch.zeros_like(input))
+        input_neg         = torch.where(input <= 0, input, torch.zeros_like(input))
+
+        def f1(X1, X2, W1, W2, ctx): 
+            Z1  = F.conv2d(X1, W1, bias=None, stride=ctx.stride, padding=ctx.padding) 
+            Z2  = F.conv2d(X2, W2, bias=None, stride=ctx.stride, padding=ctx.padding)
+            Z   = Z1 + Z2
+
+            rel_out = relevance_output / (Z + (Z==0).float()* 1e-6)
+            
+            if ctx.stride[0] >=2:
+                output_padding = 1
+            else:
+                output_padding = 0
+            t1 = F.conv_transpose2d(rel_out, W1, bias=None, stride=ctx.stride, padding=ctx.padding, output_padding = output_padding) 
+            t2 = F.conv_transpose2d(rel_out, W2, bias=None, stride=ctx.stride, padding=ctx.padding, output_padding = output_padding)
+
+            r1  = t1 * X1
+            r2  = t2 * X2
+
+            return r1 + r2
+        pos_rel         = f1(input_pos, input_neg, weights_pos, weights_neg, ctx)
+        neg_rel         = f1(input_neg, input_pos, weights_pos, weights_neg, ctx)
+        relevance_input = pos_rel * alpha - neg_rel * beta
+
+        trace.do_trace(relevance_input) 
+        return relevance_input, None, None, None, None, None, None
+
+
+class Conv2DAlpha1Beta0(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _conv_alpha_beta_forward_2d(ctx, input, weight, bias, stride, padding, dilation, groups, **kwargs)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _conv_alpha_beta_backward_2d(2., 1., ctx, relevance_output)
+
+
+class Conv2DAlpha2Beta1(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _conv_alpha_beta_forward_2d(ctx, input, weight, bias, stride, padding, dilation, groups, **kwargs)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _conv_alpha_beta_backward_2d(2., 1., ctx, relevance_output)
+
+
+
+
+
+
+
+def _forward_rho_3d(rho, incr, ctx, input, weight, bias, stride, padding, dilation, groups):
+        ctx.save_for_backward(input, weight, bias)
+        ctx.rho = rho
+        ctx.incr = incr
+        ctx.stride = stride
+        ctx.padding = padding
+        ctx.dilation = dilation
+        ctx.groups = groups
+
+        Z = F.conv3d(input, weight, bias, stride, padding, dilation, groups)
+        return Z
+
+def _backward_rho_3d(ctx, relevance_output):
+    input, weight, bias    = ctx.saved_tensors
+
+    weight, bias     = ctx.rho(weight, bias)
+    Z                = ctx.incr(F.conv2d(input, weight, bias, ctx.stride, ctx.padding, ctx.dilation, ctx.groups))
+
+    relevance_output = relevance_output / Z
+    
+    if ctx.stride[0] >=2:
+        output_padding = 1
+    else:
+        output_padding = 0
+                
+    relevance_input  = F.conv_transpose3d(relevance_output, weight, None, padding=ctx.padding)
+    relevance_input  = relevance_input * input
+
+    trace.do_trace(relevance_input) 
+    return relevance_input, None, None, None, None, None, None, 
+
+
+
+class Conv3DEpsilon(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _forward_rho_3d(identity_fn, add_epsilon_fn(1e-1), ctx, input, weight, bias, stride, padding, dilation, groups)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _backward_rho_3d(ctx, relevance_output)
+
+class Conv3DGamma(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _forward_rho_3d(gamma_fn(0.1), add_epsilon_fn(1e-10), ctx, input, weight, bias, stride, padding, dilation, groups)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _backward_rho_3d(ctx, relevance_output)
+
+class Conv3DGammaEpsilon(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _forward_rho_3d(gamma_fn(0.1), add_epsilon_fn(1e-1), ctx, input, weight, bias, stride, padding, dilation, groups)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _backward_rho_3d(ctx, relevance_output)
+    
+    
+
+def _conv_alpha_beta_forward_3d(ctx, input, weight, bias, stride, padding, dilation, groups, **kwargs): 
+    Z = F.conv3d(input, weight, bias, stride, padding, dilation, groups)
+    ctx.save_for_backward(input, weight, Z,  bias)
+    ctx.stride = stride
+    ctx.padding = padding
+    
+    return Z
+
+def _conv_alpha_beta_backward_3d(alpha, beta, ctx, relevance_output):
+        input, weights, Z, bias = ctx.saved_tensors
+        sel = weights > 0
+        zeros = torch.zeros_like(weights)
+
+        weights_pos       = torch.where(sel,  weights, zeros)
+        weights_neg       = torch.where(~sel, weights, zeros)
+
+        input_pos         = torch.where(input >  0, input, torch.zeros_like(input))
+        input_neg         = torch.where(input <= 0, input, torch.zeros_like(input))
+
+        def f1(X1, X2, W1, W2, ctx): 
+            Z1  = F.conv3d(X1, W1, bias=None, stride=ctx.stride, padding=ctx.padding) 
+            Z2  = F.conv3d(X2, W2, bias=None, stride=ctx.stride, padding=ctx.padding)
+            Z   = Z1 + Z2
+
+            rel_out = relevance_output / (Z + (Z==0).float()* 1e-6)
+            
+            if ctx.stride[0] >=2:
+                output_padding = 1
+            else:
+                output_padding = 0
+            t1 = F.conv_transpose3d(rel_out, W1, bias=None, stride=ctx.stride, padding=ctx.padding, output_padding = output_padding) 
+            t2 = F.conv_transpose3d(rel_out, W2, bias=None, stride=ctx.stride, padding=ctx.padding, output_padding = output_padding)
+
+            r1  = t1 * X1
+            r2  = t2 * X2
+
+            return r1 + r2
+        pos_rel         = f1(input_pos, input_neg, weights_pos, weights_neg, ctx)
+        neg_rel         = f1(input_neg, input_pos, weights_pos, weights_neg, ctx)
+        relevance_input = pos_rel * alpha - neg_rel * beta
+
+        trace.do_trace(relevance_input) 
+        return relevance_input, None, None, None, None, None, None
+
+
+class Conv3DAlpha1Beta0(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _conv_alpha_beta_forward_3d(ctx, input, weight, bias, stride, padding, dilation, groups, **kwargs)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _conv_alpha_beta_backward_3d(1., 0., ctx, relevance_output) # alpha, beta were 2, 1. Should be 1, 0?
+
+
+class Conv3DAlpha2Beta1(Function):
+    @staticmethod
+    def forward(ctx, input, weight, bias=None, stride=1, padding=0, dilation=1, groups=1, **kwargs):
+        return _conv_alpha_beta_forward_3d(ctx, input, weight, bias, stride, padding, dilation, groups, **kwargs)
+    
+    @staticmethod
+    def backward(ctx, relevance_output):
+        return _conv_alpha_beta_backward_3d(2., 1., ctx, relevance_output)
+
+
+
+
+conv2d = {
+        "gradient":             F.conv2d,
+        "epsilon":              Conv2DEpsilon.apply,
+        "gamma":                Conv2DGamma.apply,
+        "gamma+epsilon":        Conv2DGammaEpsilon.apply,
+        "alpha1beta0":          Conv2DAlpha1Beta0.apply,
+        "alpha2beta1":          Conv2DAlpha2Beta1.apply,
+}
+conv3d = {
+        "gradient":             F.conv3d,
+        "epsilon":              Conv3DEpsilon.apply,
+        "gamma":                Conv3DGamma.apply,
+        "gamma+epsilon":        Conv3DGammaEpsilon.apply,
+        "alpha1beta0":          Conv3DAlpha1Beta0.apply,
+        "alpha2beta1":          Conv3DAlpha2Beta1.apply,
+}
+
+
